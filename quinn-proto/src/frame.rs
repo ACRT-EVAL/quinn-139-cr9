@@ -1,4 +1,4 @@
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::{fmt, io, mem};
 
 use bytes::{Buf, BufMut, Bytes};
@@ -16,8 +16,15 @@ pub struct Type(u64);
 
 impl Type {
     fn stream(self) -> Option<StreamInfo> {
-        if self.0 >= STREAM_TY_MIN && self.0 <= STREAM_TY_MAX {
+        if STREAM_TYS.contains(&self.0) {
             Some(StreamInfo(self.0 as u8))
+        } else {
+            None
+        }
+    }
+    fn datagram(self) -> Option<DatagramInfo> {
+        if DATAGRAM_TYS.contains(&self.0) {
+            Some(DatagramInfo(self.0 as u8))
         } else {
             None
         }
@@ -68,7 +75,8 @@ macro_rules! frame_types {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 match self.0 {
                     $($val => f.write_str(stringify!($name)),)*
-                    x if x >= STREAM_TY_MIN && x <= STREAM_TY_MAX => f.write_str("STREAM"),
+                    x if STREAM_TYS.contains(&x) => f.write_str("STREAM"),
+                    x if DATAGRAM_TYS.contains(&x) => f.write_str("DATAGRAM"),
                     _ => write!(f, "<unknown {:02x}>", self.0),
                 }
             }
@@ -91,6 +99,15 @@ impl StreamInfo {
     }
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+struct DatagramInfo(u8);
+
+impl DatagramInfo {
+    fn len(self) -> bool {
+        self.0 & 0x01 != 0
+    }
+}
+
 frame_types! {
     PADDING = 0x00,
     PING = 0x01,
@@ -100,7 +117,7 @@ frame_types! {
     STOP_SENDING = 0x05,
     CRYPTO = 0x06,
     NEW_TOKEN = 0x07,
-    // STREAM = STREAM_TY_MIN..STREAM_TY_MAX,
+    // STREAM
     MAX_DATA = 0x10,
     MAX_STREAM_DATA = 0x11,
     MAX_STREAMS_BIDI = 0x12,
@@ -115,10 +132,11 @@ frame_types! {
     PATH_RESPONSE = 0x1b,
     CONNECTION_CLOSE = 0x1c,
     APPLICATION_CLOSE = 0x1d,
+    // DATAGRAM
 }
 
-const STREAM_TY_MIN: u64 = 0x08;
-const STREAM_TY_MAX: u64 = 0x0f;
+const STREAM_TYS: RangeInclusive<u64> = RangeInclusive::new(0x08, 0x0f);
+const DATAGRAM_TYS: RangeInclusive<u64> = RangeInclusive::new(0x30, 0x31);
 
 #[derive(Debug)]
 pub enum Frame {
@@ -141,6 +159,7 @@ pub enum Frame {
     PathChallenge(u64),
     PathResponse(u64),
     Close(Close),
+    Datagram(Datagram),
     Invalid { ty: Type, reason: &'static str },
 }
 
@@ -165,7 +184,7 @@ impl Frame {
             RetireConnectionId { .. } => Type::RETIRE_CONNECTION_ID,
             Ack(_) => Type::ACK,
             Stream(ref x) => {
-                let mut ty = STREAM_TY_MIN;
+                let mut ty = *STREAM_TYS.start();
                 if x.fin {
                     ty |= 0x01;
                 }
@@ -179,6 +198,7 @@ impl Frame {
             NewConnectionId { .. } => Type::NEW_CONNECTION_ID,
             Crypto(_) => Type::CRYPTO,
             NewToken { .. } => Type::NEW_TOKEN,
+            Datagram(_) => Type(*DATAGRAM_TYS.start()),
             Invalid { ty, .. } => ty,
         }
     }
@@ -410,7 +430,7 @@ impl FrameStruct for Stream {
 
 impl Stream {
     pub fn encode<W: BufMut>(&self, length: bool, out: &mut W) {
-        let mut ty = STREAM_TY_MIN;
+        let mut ty = *STREAM_TYS.start();
         if self.offset != 0 {
             ty |= 0x04;
         }
@@ -615,25 +635,38 @@ impl Iter {
             Type::NEW_TOKEN => Frame::NewToken {
                 token: self.take_len()?,
             },
-            _ => match ty.stream() {
-                Some(s) => Frame::Stream(Stream {
-                    id: self.bytes.get()?,
-                    offset: if s.off() { self.bytes.get_var()? } else { 0 },
-                    fin: s.fin(),
-                    data: if s.len() {
-                        self.take_len()?
-                    } else {
-                        let mut x = mem::replace(self.bytes.get_mut(), Bytes::new());
-                        x.advance(self.bytes.position() as usize);
-                        self.bytes.set_position(0);
-                        x
-                    },
-                }),
-                None => {
+            _ => {
+                if let Some(s) = ty.stream() {
+                    Frame::Stream(Stream {
+                        id: self.bytes.get()?,
+                        offset: if s.off() { self.bytes.get_var()? } else { 0 },
+                        fin: s.fin(),
+                        data: if s.len() {
+                            self.take_len()?
+                        } else {
+                            self.take_remaining()
+                        },
+                    })
+                } else if let Some(d) = ty.datagram() {
+                    Frame::Datagram(Datagram {
+                        data: if d.len() {
+                            self.take_len()?
+                        } else {
+                            self.take_remaining()
+                        },
+                    })
+                } else {
                     return Err(IterErr::InvalidFrameId);
                 }
-            },
+            }
         })
+    }
+
+    fn take_remaining(&mut self) -> Bytes {
+        let mut x = mem::replace(self.bytes.get_mut(), Bytes::new());
+        x.advance(self.bytes.position() as usize);
+        self.bytes.set_position(0);
+        x
     }
 }
 
@@ -757,6 +790,36 @@ impl NewConnectionId {
 
 /// Smallest number of bytes this type of frame is guaranteed to fit within.
 pub const RETIRE_CONNECTION_ID_SIZE_BOUND: usize = 9;
+
+/// An unreliable datagram
+#[derive(Debug, Clone)]
+pub struct Datagram {
+    /// Payload
+    pub data: Bytes,
+}
+
+impl FrameStruct for Datagram {
+    const SIZE_BOUND: usize = 1 + 8;
+}
+
+impl Datagram {
+    pub(crate) fn encode<W: BufMut>(&self, length: bool, out: &mut W) {
+        out.write(Type(*DATAGRAM_TYS.start() | if length { 1 } else { 0 })); // 1 byte
+        if length {
+            // Safe to unwrap because we check length sanity before queueing datagrams
+            out.write(VarInt::from_u64(self.data.len() as u64).unwrap()); // <= 8 bytes
+        }
+        out.put_slice(&self.data);
+    }
+
+    pub(crate) fn size(&self, length: bool) -> usize {
+        1 + if length {
+            VarInt::from_u64(self.data.len() as u64).unwrap().size()
+        } else {
+            0
+        } + self.data.len()
+    }
+}
 
 #[cfg(test)]
 mod test {
